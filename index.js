@@ -1,10 +1,12 @@
 const express = require("express");
 const bodyParser = require("body-parser");
+const cors = require("cors");
 const db = require("./db"); // Import the database connection
 const app = express();
 const port = 3000;
 require("dotenv").config();
 
+app.use(cors());
 // Middleware to parse JSON bodies
 app.use(bodyParser.json());
 
