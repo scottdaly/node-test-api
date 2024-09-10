@@ -1,5 +1,6 @@
 const express = require("express");
 const bodyParser = require("body-parser");
+const axios = require("axios");
 const cors = require("cors");
 const db = require("./db"); // Import the database connection
 const app = express();
@@ -14,6 +15,7 @@ app.use(bodyParser.json());
 
 // List all users
 app.get("/users", async (req, res) => {
+  console.log("getting users");
   try {
     const result = await db.query("SELECT * FROM users");
     res.json(result.rows);
@@ -25,6 +27,7 @@ app.get("/users", async (req, res) => {
 
 // Create a new user
 app.post("/users", async (req, res) => {
+  console.log("posting to users");
   const { username, name, email, password } = req.body;
 
   if (!username) {
@@ -38,7 +41,7 @@ app.post("/users", async (req, res) => {
   try {
     const result = await db.query(
       "INSERT INTO users (username, name, email, password) VALUES ($1, $2, $3, $4) RETURNING *",
-      [username, name, email, hashedPassword]
+      [username, name, email, password]
     );
 
     // Return the created user (excluding the password)
@@ -53,6 +56,7 @@ app.post("/users", async (req, res) => {
 
 // Update a user's details
 app.patch("/users/:id", async (req, res) => {
+  console.log("patching to users");
   const { id } = req.params;
   const { username, name, email, password } = req.body;
 
@@ -92,6 +96,7 @@ app.patch("/users/:id", async (req, res) => {
 
 // Delete a user
 app.delete("/users/:id", async (req, res) => {
+  console.log("deleting user");
   const { id } = req.params;
 
   try {
@@ -118,6 +123,7 @@ app.delete("/users/:id", async (req, res) => {
 
 // List all characters
 app.get("/characters", async (req, res) => {
+  console.log("getting characters");
   try {
     const result = await db.query("SELECT * FROM characters");
     res.json(result.rows);
@@ -127,9 +133,34 @@ app.get("/characters", async (req, res) => {
   }
 });
 
+// Get a specific character by ID
+app.get("/characters/:id", async (req, res) => {
+  const { id } = req.params;
+  console.log("getting character");
+
+  try {
+    // Query to fetch the character by ID
+    const result = await db.query("SELECT * FROM characters WHERE id = $1", [
+      id,
+    ]);
+
+    // If no character was found, return a 404
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Character not found" });
+    }
+
+    // Return the character details
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Database error" });
+  }
+});
+
 // Create a new character
 app.post("/characters", async (req, res) => {
-  const { name, description, model, userID } = req.body;
+  console.log("creating character");
+  const { name, description, image_url, model, creator_id } = req.body;
 
   if (!name || !description) {
     return res
@@ -141,14 +172,16 @@ app.post("/characters", async (req, res) => {
     return res.status(400).json({ message: "Model is required" });
   }
 
-  if (!userID) {
-    return res.status(400).json({ message: "Creator's userID is required" });
+  if (!creator_id) {
+    return res
+      .status(400)
+      .json({ message: "Creator's creator_id is required" });
   }
 
   try {
     const result = await db.query(
-      "INSERT INTO characters (name, description, model, userID) VALUES ($1, $2, $3, $4) RETURNING *",
-      [name, description, model, userID]
+      "INSERT INTO characters (name, description, image_url, model, creator_id) VALUES ($1, $2, $3, $4) RETURNING *",
+      [name, description, image_url || null, model, creator_id]
     );
     res
       .status(201)
@@ -161,12 +194,14 @@ app.post("/characters", async (req, res) => {
 
 app.patch("/characters/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, description, model } = req.body;
+  const { name, description, image_url, model } = req.body;
+  console.log("patching character");
 
   // Build the dynamic SQL query based on the provided fields
   const updates = [];
   if (name) updates.push(`name = '${name}'`);
   if (description) updates.push(`description = '${description}'`);
+  if (image_url !== undefined) updates.push(`image_url = '${image_url}'`);
   if (model) updates.push(`model = '${model}'`);
 
   if (updates.length == 0) {
@@ -179,7 +214,7 @@ app.patch("/characters/:id", async (req, res) => {
     // Construct SQL query dynamically
     const query = `UPDATE characters SET ${updates.join(
       ", "
-    )} WHERE id = $1 RETURNING *`;
+    )}, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`;
     const result = await db.query(query, [id]);
 
     // If no character was found, return 404
@@ -198,6 +233,7 @@ app.patch("/characters/:id", async (req, res) => {
 
 app.delete("/characters/:id", async (req, res) => {
   const { id } = req.params;
+  console.log("deleting character");
 
   try {
     const result = await db.query(
@@ -220,17 +256,34 @@ app.delete("/characters/:id", async (req, res) => {
 
 // Get all conversations for a user
 app.get("/conversations", async (req, res) => {
-  const { user_id } = req.query;
+  const { user_id, character_id } = req.query;
+  console.log("getting conversations");
 
   if (!user_id) {
     return res.status(400).json({ message: "user_id is required" });
   }
 
   try {
-    const result = await db.query(
-      "SELECT * FROM conversations WHERE user_id = $1 ORDER BY last_message_at DESC",
-      [user_id]
-    );
+    let result;
+
+    if (character_id) {
+      // If character_id is provided, filter by both user_id and character_id
+      result = await db.query(
+        `SELECT * FROM conversations 
+         WHERE user_id = $1 AND character_id = $2 
+         ORDER BY last_message_at DESC`,
+        [user_id, character_id]
+      );
+    } else {
+      // If only user_id is provided, fetch all conversations for that user
+      result = await db.query(
+        `SELECT * FROM conversations 
+         WHERE user_id = $1 
+         ORDER BY last_message_at DESC`,
+        [user_id]
+      );
+    }
+
     res.json(result.rows);
   } catch (error) {
     console.error(error);
@@ -241,6 +294,7 @@ app.get("/conversations", async (req, res) => {
 // Get a specific conversation by ID
 app.get("/conversations/:id", async (req, res) => {
   const { id } = req.params;
+  console.log("getting conversation");
 
   try {
     const result = await db.query("SELECT * FROM conversations WHERE id = $1", [
@@ -261,6 +315,7 @@ app.get("/conversations/:id", async (req, res) => {
 // Create a new conversation
 app.post("/conversations", async (req, res) => {
   const { user_id, character_id, title } = req.body;
+  console.log("creating conversation");
 
   if (!user_id || !character_id || !title) {
     return res
@@ -287,6 +342,7 @@ app.post("/conversations", async (req, res) => {
 app.patch("/conversations/:id", async (req, res) => {
   const { id } = req.params; // The conversation ID from the URL
   const { title, last_message_content, last_message_role } = req.body;
+  console.log("patching conversation");
 
   // Build the dynamic SQL query based on the provided fields
   const updates = [];
@@ -329,6 +385,7 @@ app.patch("/conversations/:id", async (req, res) => {
 // Delete a conversation by ID
 app.delete("/conversations/:id", async (req, res) => {
   const { id } = req.params;
+  console.log("deleting conversation");
 
   try {
     const result = await db.query(
@@ -352,6 +409,7 @@ app.delete("/conversations/:id", async (req, res) => {
 // Get all messages for a conversation
 app.get("/messages", async (req, res) => {
   const { conversation_id } = req.query;
+  console.log("getting messages");
 
   if (!conversation_id) {
     return res.status(400).json({ message: "conversation_id is required" });
@@ -372,6 +430,7 @@ app.get("/messages", async (req, res) => {
 // Add a message to a conversation
 app.post("/messages", async (req, res) => {
   const { conversation_id, role, content } = req.body;
+  console.log("posting message");
 
   if (!conversation_id || !role || !content) {
     return res
@@ -409,6 +468,7 @@ app.post("/messages", async (req, res) => {
 // Delete a message by ID
 app.delete("/messages/:id", async (req, res) => {
   const { id } = req.params;
+  console.log("deleting message");
 
   try {
     // Retrieve the message to get its conversation_id before deleting
@@ -471,6 +531,63 @@ app.delete("/messages/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Database error" });
+  }
+});
+
+app.post("/chat", async (req, res) => {
+  const { conversation_id } = req.body;
+  console.log("entering chat route. Conversation Id:", conversation_id);
+
+  try {
+    const messages = await db.query(
+      "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      [conversation_id]
+    );
+
+    console.log("Got messages", messages);
+
+    const conversationContext = messages.rows.map((msg) => ({
+      role: msg.role,
+      content: msg.content,
+    }));
+
+    console.log("Got conversation context", conversationContext);
+
+    console.log("About to send api key");
+
+    const llmResponse = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o", // Or whichever LLM model you're using
+        messages: conversationContext,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("Got llm response", llmResponse.data.choices[0].message);
+
+    const aiMessage = llmResponse.data.choices[0].message.content;
+    const aiRole = llmResponse.data.choices[0].message.role;
+
+    await db.query(
+      "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)",
+      [conversation_id, aiRole, aiMessage]
+    );
+
+    res.json({
+      ai_message: aiMessage,
+      conversation_id: conversation_id,
+    });
+  } catch (err) {
+    console.log("Error with chat route", err);
+    res
+      .send(500)
+      .json({ message: "Failed to generate AI response", error: err });
   }
 });
 
