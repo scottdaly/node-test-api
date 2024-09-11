@@ -2,14 +2,314 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const argon2 = require("argon2");
 const db = require("./db"); // Import the database connection
+
 const app = express();
 const port = 3000;
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const cookieParser = require("cookie-parser");
+
 require("dotenv").config();
 
-app.use(cors());
+// CORS configuration
+const corsOptions = {
+  origin: process.env.FRONTEND_URL || "http://localhost:5173", // Vite's default port
+  credentials: true, // This is important for cookies
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
 // Middleware to parse JSON bodies
 app.use(bodyParser.json());
+
+app.use(cookieParser());
+
+// Initialize passport
+app.use(passport.initialize());
+
+// JWT helper functions
+const createToken = (user) => {
+  return jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
+    expiresIn: "1d",
+  });
+};
+
+const createRefreshToken = (user) => {
+  return jwt.sign({ userId: user.id }, process.env.REFRESH_TOKEN_SECRET, {
+    expiresIn: "7d",
+  });
+};
+
+/* Google Login */
+
+// Set up Passport Google Strategy
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "/auth/google/callback",
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        // First, try to find an existing user
+        let result = await dbquery(
+          "SELECT id, username, name, email, google_id, created_at, oauth_provider, last_login FROM users WHERE google_id = $1",
+          [profile.id]
+        );
+
+        let user;
+
+        if (result.rows.length > 0) {
+          // User exists, update their information
+          user = result.rows[0];
+          await pool.query(
+            "UPDATE users SET email = $1, name = $2, last_login = NOW() WHERE google_id = $3",
+            [profile.emails[0].value, profile.displayName, profile.id]
+          );
+        } else {
+          // User doesn't exist, create a new one
+          result = await db.query(
+            `INSERT INTO users (google_id, email, name, username, oauth_provider, created_at, last_login)
+         VALUES ($1, $2, $3, $4, 'google', NOW(), NOW())
+         RETURNING id, username, name, email, google_id, created_at, oauth_provider, last_login`,
+            [
+              profile.id,
+              profile.emails[0].value,
+              profile.displayName,
+              profile.emails[0].value,
+            ]
+          );
+          user = result.rows[0];
+        }
+
+        done(null, user);
+      } catch (error) {
+        console.error("Error in Google Strategy:", error);
+        done(error, null);
+      }
+    }
+  )
+);
+
+// Routes
+app.get(
+  "/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { session: false }),
+  async (req, res) => {
+    const user = req.user;
+    const token = createToken(user);
+    const refreshToken = createRefreshToken(user);
+
+    await db.query("UPDATE users SET refresh_token = $1 WHERE id = $2", [
+      refreshToken,
+      user.id,
+    ]);
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.redirect("http://localhost:5173/");
+  }
+);
+
+// Local registration route
+app.post("/auth/register", async (req, res) => {
+  const { username, email, password, name } = req.body;
+  try {
+    const hashedPassword = await argon2.hash(password);
+    const result = await db.query(
+      `INSERT INTO users (username, email, password, name, oauth_provider, created_at, last_login)
+       VALUES ($1, $2, $3, $4, 'local', NOW(), NOW())
+       RETURNING id, username, email, name`,
+      [username, email, hashedPassword, name]
+    );
+    const user = result.rows[0];
+    const token = createToken(user);
+    const refreshToken = createRefreshToken(user);
+
+    await db.query("UPDATE users SET refresh_token = $1 WHERE id = $2", [
+      refreshToken,
+      user.id,
+    ]);
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.status(201).json({ message: "User registered successfully", user });
+  } catch (error) {
+    res.status(500).json({ error: "Error registering user" });
+  }
+});
+
+// Local login route
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const result = await db.query(
+      "SELECT * FROM users WHERE email = $1 AND oauth_provider = 'local'",
+      [email]
+    );
+    const user = result.rows[0];
+
+    if (
+      !user ||
+      !user.password ||
+      !(await argon2.verify(user.password, password))
+    ) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const token = createToken(user);
+    const refreshToken = createRefreshToken(user);
+
+    await db.query(
+      "UPDATE users SET refresh_token = $1, last_login = NOW() WHERE id = $2",
+      [refreshToken, user.id]
+    );
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.cookie("refreshToken", refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.json({
+      message: "Logged in successfully",
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        name: user.name,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Error logging in" });
+  }
+});
+
+// Middleware to verify JWT
+const verifyToken = (req, res, next) => {
+  const token = req.cookies.token;
+  if (!token) return res.status(401).json({ error: "Access denied" });
+
+  try {
+    const verified = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = verified;
+    next();
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+      return res
+        .status(401)
+        .json({ error: "Token expired", shouldRefresh: true });
+    }
+    res.status(400).json({ error: "Invalid token" });
+  }
+};
+
+// Token refresh route
+app.post("/auth/refresh-token", async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  if (!refreshToken)
+    return res.status(401).json({ error: "Refresh token not found" });
+
+  try {
+    const verified = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+    const result = await db.query(
+      "SELECT * FROM users WHERE id = $1 AND refresh_token = $2",
+      [verified.userId, refreshToken]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: "Invalid refresh token" });
+    }
+
+    const user = result.rows[0];
+    const newToken = createToken(user);
+    const newRefreshToken = createRefreshToken(user);
+
+    await db.query("UPDATE users SET refresh_token = $1 WHERE id = $2", [
+      newRefreshToken,
+      user.id,
+    ]);
+
+    res.cookie("token", newToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.cookie("refreshToken", newRefreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+    });
+    res.json({ message: "Token refreshed successfully" });
+  } catch (err) {
+    res.status(400).json({ error: "Invalid refresh token" });
+  }
+});
+
+// Protected route example
+app.get("/api/protected", verifyToken, (req, res) => {
+  res.json({ message: "This is a protected route", userId: req.user.userId });
+});
+
+// Logout route
+app.get("/auth/logout", async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  if (refreshToken) {
+    await db.query(
+      "UPDATE users SET refresh_token = NULL WHERE refresh_token = $1",
+      [refreshToken]
+    );
+  }
+  res.clearCookie("token");
+  res.clearCookie("refreshToken");
+  res.json({ message: "Logged out successfully" });
+});
+
+// User info route
+app.get("/api/user", verifyToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT id, username, email, name, oauth_provider FROM users WHERE id = $1",
+      [req.user.userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Error fetching user data" });
+  }
+});
 
 /* User Routes */
 
@@ -536,7 +836,6 @@ app.delete("/messages/:id", async (req, res) => {
 
 app.post("/chat", async (req, res) => {
   const { conversation_id } = req.body;
-  console.log("entering chat route. Conversation Id:", conversation_id);
 
   try {
     const messages = await db.query(
@@ -544,16 +843,10 @@ app.post("/chat", async (req, res) => {
       [conversation_id]
     );
 
-    console.log("Got messages", messages);
-
     const conversationContext = messages.rows.map((msg) => ({
       role: msg.role,
       content: msg.content,
     }));
-
-    console.log("Got conversation context", conversationContext);
-
-    console.log("About to send api key");
 
     const llmResponse = await axios.post(
       "https://api.openai.com/v1/chat/completions",
@@ -582,6 +875,85 @@ app.post("/chat", async (req, res) => {
     res.json({
       ai_message: aiMessage,
       conversation_id: conversation_id,
+    });
+  } catch (err) {
+    console.log("Error with chat route", err);
+    res
+      .send(500)
+      .json({ message: "Failed to generate AI response", error: err });
+  }
+});
+
+app.post("/get-title", async (req, res) => {
+  const { conversation_id } = req.body;
+  console.log("Generating Title for conversation id", conversation_id);
+
+  try {
+    const messages = await db.query(
+      "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      [conversation_id]
+    );
+
+    if (messages.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "No messages found for the conversation" });
+    }
+
+    const conversationContext = messages.rows.map((msg) => ({
+      role: msg.role,
+      content: msg.content,
+    }));
+
+    let conversationString = JSON.stringify(conversationContext);
+
+    console.log("conversation context", conversationString);
+
+    const llmResponse = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini", // Or whichever LLM model you're using
+        messages: [
+          {
+            role: "system",
+            content:
+              'Your job is to write a brief, descriptive title for the following conversation. Return just your title between two <title></title> tags. Here is an example: {"role":"user", "content":"Write a short poem about traffic lights"}, {"role":"assistant", "content":"Traffic lights upon the street, Colors bright where roads all meet. Red for stop, green for go, Yellow warns to take it slow. They guide our paths with steady gleam, A simple dance, a daily theme. In their glow, we pause and start, Silent keepers of the city\'s heart.}" Your response: "<title>Traffic Lights Poem</title>"',
+          },
+          {
+            role: "user",
+            content: `Write a title for the following conversation: ${JSON.stringify(
+              conversationString
+            )}`,
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("Got llm response", llmResponse.data.choices[0].message);
+
+    function extractTitle(htmlString) {
+      const titleMatch = htmlString.match(/<title>(.*?)<\/title>/);
+      return titleMatch ? titleMatch[1] : null;
+    }
+
+    const generatedTitle = extractTitle(
+      llmResponse.data.choices[0].message.content
+    );
+
+    await db.query("UPDATE conversations SET title = $1 WHERE id = $2", [
+      generatedTitle,
+      conversation_id,
+    ]);
+
+    res.json({
+      conversation_id,
+      title: generatedTitle,
     });
   } catch (err) {
     console.log("Error with chat route", err);
